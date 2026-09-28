@@ -1,5 +1,5 @@
 {
-  "name": "figma-rss-alert",
+  "name": "figma-rss",
   "active": false,
   "settings": {"executionOrder":"v1","binaryMode":"separate","timeSavedMode":"fixed","callerPolicy":"workflowsFromSameOwner","availableInMCP":true},
   "nodes": [
