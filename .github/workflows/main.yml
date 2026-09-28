@@ -1,1 +1,84 @@
+name: Deploy n8n workflow
 
+on:
+  push:
+    branches: [main]
+    paths: [workflow.json, .github/workflows/main.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate workflow
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate JSON and graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq empty workflow.json
+          jq -e '(.name | type == "string" and length > 0) and (.nodes | type == "array" and length > 0) and (.connections | type == "object")' workflow.json >/dev/null
+          duplicate_names="$(jq -r '[.nodes[].name] | group_by(.)[] | select(length > 1) | .[0]' workflow.json)"
+          if [[ -n "$duplicate_names" ]]; then
+            echo "::error::Duplicate node names found:"
+            echo "$duplicate_names"
+            exit 1
+          fi
+
+  deploy:
+    name: Deploy to n8n
+    needs: validate
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      N8N_API_URL: ${{ vars.N8N_API_URL }}
+      N8N_WORKFLOW_ID: ${{ vars.N8N_WORKFLOW_ID }}
+      N8N_API_KEY: ${{ secrets.N8N_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check deployment variables
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "$N8N_API_URL" ]] || { echo "::error::N8N_API_URL is missing"; exit 1; }
+          [[ -n "$N8N_WORKFLOW_ID" ]] || { echo "::error::N8N_WORKFLOW_ID is missing"; exit 1; }
+          [[ -n "$N8N_API_KEY" ]] || { echo "::error::N8N_API_KEY is missing"; exit 1; }
+      - name: Update n8n workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          api_url="${N8N_API_URL%/}"
+          workflow_url="$api_url/api/v1/workflows/$N8N_WORKFLOW_ID"
+          remote="$(mktemp)"
+          payload="$(mktemp)"
+          response="$(mktemp)"
+          trap 'rm -f "$remote" "$payload" "$response"' EXIT
+          curl --fail-with-body --silent --show-error --header "X-N8N-API-KEY: $N8N_API_KEY" --header "Accept: application/json" "$workflow_url" > "$remote"
+          jq -e '.id and (.nodes | type == "array") and (.connections | type == "object")' "$remote" >/dev/null
+          jq --slurpfile local workflow.json '
+            . as $remote
+            | $local[0] as $source
+            | ($remote.nodes | map({key: .name, value: .}) | from_entries) as $remote_nodes
+            | ($source.nodes | map(
+                . as $node
+                | if (($node.credentials // {}) | length) == 0
+                  then ($remote_nodes[$node.name] // {} | .credentials) as $credentials
+                  | if $credentials then $node + {credentials: $credentials} else $node end
+                  else $node
+                  end
+              )) as $nodes
+            | {name: ($source.name // $remote.name), nodes: $nodes, connections: $source.connections, settings: ($source.settings // $remote.settings), staticData: ($source.staticData // $remote.staticData // null)}
+          ' "$remote" > "$payload"
+          curl --fail-with-body --silent --show-error --request PUT --header "X-N8N-API-KEY: $N8N_API_KEY" --header "Content-Type: application/json" --header "Accept: application/json" --data-binary "@$payload" "$workflow_url" > "$response"
+          jq -e --arg id "$N8N_WORKFLOW_ID" '.id == $id' "$response" >/dev/null
+          {
+            echo "### n8n deployment"
+            echo
+            echo "- Workflow ID: $N8N_WORKFLOW_ID"
+            echo "- Name: $(jq -r '.name // "unknown"' "$response")"
+            echo "- Nodes: $(jq -r '.nodes | length' "$response")"
+            echo "- Active state: preserved from n8n"
+          } >> "$GITHUB_STEP_SUMMARY"
